@@ -32,6 +32,23 @@ describe('extractWikiLinks', () => {
     const links = extractWikiLinks('Both [[Alice]] and [[Bob]] agreed on [[Plan]].');
     expect(links).toHaveLength(3);
   });
+
+  it('does not span newlines (regression: truncated [[X opens monster match)', () => {
+    // Without the \n exclusion, the regex eagerly captures across paragraphs
+    // until the next ]] arrives — producing stub IDs that contain newlines
+    // and quoted prose. Common in vault content that quotes truncated edge
+    // contexts (e.g., stub-promotion "Referenced From" sections).
+    const md = `## Topics
+- Topic line ends with truncated [[Compliance.md
+- Next bullet here
+- Yet another with [[BOM]] real link
+- Closing paren ]] much later`;
+    const links = extractWikiLinks(md);
+    // The truncated `[[Compliance.md` should NOT be extracted as a link.
+    // Only the real `[[BOM]]` should match.
+    expect(links).toHaveLength(1);
+    expect(links[0].raw).toBe('BOM');
+  });
 });
 
 describe('buildStemLookup', () => {

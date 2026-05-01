@@ -96,6 +96,48 @@ def resolve_paths() -> tuple[Path, Path]:
     return vault, data
 
 
+import re as _re
+
+_WIKILINK = _re.compile(r"\[\[([^\]]+)\]\]")
+_WIKILINK_DANGLING = _re.compile(r"\[\[[^\]]*$")
+
+
+def _scrub_wiki_links(text: str) -> str:
+    """Replace [[X]] / [[X|alias]] with X (or alias) AND strip any dangling
+    [[X (truncated at the end) so quoted contexts don't introduce new
+    wiki-link edges when re-parsed.
+
+    Without this, a context line like "Topics: [[D365 F&O]], [[Finance]]"
+    would create new wiki-link edges to D365 F&O and Finance from the file
+    that quotes it, propagating stubs back into the graph. Truncated
+    fragments like "[[Strate" at end-of-string also count to the parser
+    once they're saved + re-read.
+    """
+    def _sub(m: "_re.Match[str]") -> str:
+        inner = m.group(1)
+        if "|" in inner:
+            inner = inner.split("|", 1)[1]
+        return inner
+
+    text = _WIKILINK.sub(_sub, text)
+    # Strip dangling truncated `[[X` fragments at end of string
+    text = _WIKILINK_DANGLING.sub("", text).rstrip()
+    return text
+
+
+def _truncate_clean(text: str, limit: int = 200) -> str:
+    """Truncate to ~limit chars but on a wiki-link-safe boundary."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # If the cut leaves an unclosed `[[`, retreat to before it
+    last_open = cut.rfind("[[")
+    last_close = cut.rfind("]]")
+    if last_open > last_close:
+        cut = cut[:last_open].rstrip()
+    return cut
+
+
 def fetch_top_stubs(db_path: Path, threshold: int) -> list[dict]:
     """Return [{stub_id, title, inbound, references: [{source_id, context}]}, ...]."""
     db = sqlite3.connect(str(db_path))
@@ -126,7 +168,9 @@ def fetch_top_stubs(db_path: Path, threshold: int) -> list[dict]:
             "references": [
                 {
                     "source_id": e["source_id"],
-                    "context": (e["context"] or "")[:200].replace("\n", " ").strip(),
+                    "context": _scrub_wiki_links(
+                        _truncate_clean((e["context"] or "").replace("\n", " ").strip())
+                    ),
                 }
                 for e in refs
             ],
@@ -264,30 +308,44 @@ def plan_writes(vault: Path, stubs: list[dict]) -> list[dict]:
     return plan
 
 
-def apply_plan(plan: list[dict]) -> dict:
-    created, skipped = 0, 0
+def apply_plan(plan: list[dict], overwrite: bool) -> dict:
+    created, updated, skipped = 0, 0, 0
     skipped_targets: list[str] = []
     for p in plan:
-        if p["exists"]:
+        if p["exists"] and not overwrite:
             skipped += 1
             skipped_targets.append(str(p["target"]))
             continue
         p["target"].parent.mkdir(parents=True, exist_ok=True)
         p["target"].write_text(p["content"], encoding="utf-8")
-        created += 1
-    return {"created": created, "skipped": skipped, "skipped_targets": skipped_targets}
+        if p["exists"]:
+            updated += 1
+        else:
+            created += 1
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "skipped_targets": skipped_targets,
+    }
 
 
-def print_plan(plan: list[dict]) -> None:
+def print_plan(plan: list[dict], overwrite: bool) -> None:
     print(f"Plan: {len(plan)} stub(s) above threshold")
     for p in plan:
-        marker = "SKIP (exists)" if p["exists"] else "CREATE"
+        if p["exists"] and overwrite:
+            marker = "OVERWRITE"
+        elif p["exists"]:
+            marker = "SKIP (exists)"
+        else:
+            marker = "CREATE"
         print(f"  [{marker:14}] {p['kind']:8}  inbound={p['inbound']:>3}  -> {p['target']}")
 
 
 def main() -> int:
     args = sys.argv[1:]
     apply = "--apply" in args
+    overwrite = "--overwrite" in args
     dry = "--dry-run" in args or not apply
     threshold = 5
     for i, a in enumerate(args):
@@ -309,20 +367,24 @@ def main() -> int:
         return 0
 
     plan = plan_writes(vault, stubs)
-    print_plan(plan)
+    print_plan(plan, overwrite)
     print()
     if dry:
-        print("Dry run. Re-run with --apply to write files.")
+        print("Dry run. Re-run with --apply (and --overwrite to update existing) to write files.")
         return 0
 
-    result = apply_plan(plan)
-    print(f"Wrote {result['created']} file(s); skipped {result['skipped']} (already exist).")
-    if result["skipped_targets"]:
+    result = apply_plan(plan, overwrite)
+    print(
+        f"Wrote {result['created']} new + updated {result['updated']}; "
+        f"skipped {result['skipped']} (already exist; pass --overwrite to update)."
+    )
+    if result["skipped_targets"] and not overwrite:
         for t in result["skipped_targets"]:
             print(f"  skipped: {t}")
     print()
-    print("Next: re-run kg evolution cycle to pick up the new files:")
-    print("  python scripts/evolution_cycle.py --quiet")
+    print("Next: re-run kg evolution cycle WITH --force to re-resolve wiki-links")
+    print("from existing source files (incremental skip would miss them):")
+    print("  python scripts/evolution_cycle.py --force --quiet")
     return 0
 
 

@@ -13,8 +13,11 @@ export function extractWikiLinks(markdown: string): RawLink[] {
   const withoutCode = markdown.replace(/```[\s\S]*?```/g, '')
     .replace(/`[^`]+`/g, '');
 
-  // Match [[...]] but not ![[...]]
-  const pattern = /(?<!!)\[\[([^\]]+)\]\]/g;
+  // Match [[...]] but not ![[...]]. Disallow newlines and pipe-stripping
+  // happens after — keep the inner constraint single-line so a truncated /
+  // malformed `[[X` at end of paragraph doesn't gobble subsequent paragraphs
+  // until the next `]]` arrives much later.
+  const pattern = /(?<!!)\[\[([^\]\n]+)\]\]/g;
   let match;
   while ((match = pattern.exec(withoutCode)) !== null) {
     const inner = match[1];

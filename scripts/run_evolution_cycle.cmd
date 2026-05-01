@@ -14,11 +14,15 @@ powershell -Command "if ((Test-Path '%LOGFILE%') -and (Get-Item '%LOGFILE%').Len
 
 if not exist output mkdir output
 
-set KG_VAULT_PATH=C:\Users\Dmitry Liakhovets\Development\Obsidian data update
-set KG_DATA_DIR=C:\Users\Dmitry Liakhovets\.local\share\knowledge-graph
+set KG_VAULT_PATH=%USERPROFILE%\Development\Obsidian data update
+set KG_DATA_DIR=%USERPROFILE%\.local\share\knowledge-graph
 
-echo [%date% %time%] Starting kg evolution cycle >> "%LOGFILE%"
-"C:\Python314\python.exe" scripts\evolution_cycle.py --quiet >> "%LOGFILE%" 2>&1
+REM Resolve Python: prefer user-local install, fall back to PATH.
+set PYEXE=%LOCALAPPDATA%\Programs\Python\Python314\python.exe
+if not exist "%PYEXE%" set PYEXE=python
+
+echo [%date% %time%] Starting kg evolution cycle (python: %PYEXE%) >> "%LOGFILE%"
+"%PYEXE%" scripts\evolution_cycle.py --quiet >> "%LOGFILE%" 2>&1
 set RC=%ERRORLEVEL%
 echo [%date% %time%] Completed with exit code %RC% >> "%LOGFILE%"
 
