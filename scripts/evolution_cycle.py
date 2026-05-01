@@ -47,6 +47,14 @@ DATA_DEFAULT = Path.home() / ".local" / "share" / "knowledge-graph"
 LOG_PATH = REPO_ROOT / "output" / "kg_evolution_log.jsonl"
 LATEST_PATH = REPO_ROOT / "output" / "kg_evolution_latest.json"
 
+# Lint thresholds — extracted from compute_lints() per adversarial review
+# Architect/4 (medium). Tuned for a ~1700-node vault. Re-tune for vaults of
+# substantially different scale (e.g., 10K+ nodes).
+STUB_SPIKE_RATIO = 1.25         # cur > prev * this  → MEDIUM stub_spike
+NODE_DRIFT_RATIO = 0.10         # |cur - prev| > prev * this → MEDIUM node drift
+PROMOTION_INBOUND_MIN = 5       # stub with >= this inbound = LOW promotion candidate
+DB_PROBE_TIMEOUT = 15           # sqlite3.connect timeout (s) — handles concurrent writers
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -74,6 +82,11 @@ def run_index(force: bool, quiet: bool, vault: Path, data: Path) -> tuple[int, d
     env["KG_VAULT_PATH"] = str(vault)
     env["KG_DATA_DIR"] = str(data)
     start = time.time()
+    # Defensive: shell=False is the safe Python convention (Python docs warn
+    # that shell=True+list has implementation-defined behavior). On Python 3.14
+    # the args ARE forwarded correctly (verified by `force=True` runs producing
+    # the expected `nodesIndexed=N skipped=0`), but we don't rely on the quirk.
+    # `npx.cmd` is on PATH so shell=False resolves it without invoking cmd.exe.
     proc = subprocess.run(
         args,
         cwd=REPO_ROOT,
@@ -81,7 +94,7 @@ def run_index(force: bool, quiet: bool, vault: Path, data: Path) -> tuple[int, d
         text=True,
         encoding="utf-8",
         errors="replace",
-        shell=True,
+        shell=False,
         env=env,
     )
     elapsed = time.time() - start
@@ -118,10 +131,31 @@ def run_index(force: bool, quiet: bool, vault: Path, data: Path) -> tuple[int, d
 
 
 def probe_db(db_path: Path) -> dict:
-    """Read additional health metrics directly from kg.db."""
+    """Read additional health metrics directly from kg.db.
+
+    Returns a dict that always includes _db_missing or _db_error on failure
+    rather than raising — caller can still log the run and lint on the
+    error itself.
+    """
     if not db_path.exists():
         return {"_db_missing": True}
-    db = sqlite3.connect(str(db_path))
+    try:
+        db = sqlite3.connect(str(db_path), timeout=DB_PROBE_TIMEOUT)
+    except sqlite3.OperationalError as e:
+        return {"_db_error": f"connect: {e}"}
+    try:
+        return _probe_db_inner(db)
+    except sqlite3.OperationalError as e:
+        # `database is locked` or schema-mismatch errors don't crash the cycle.
+        return {"_db_error": f"query: {e}"}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _probe_db_inner(db: sqlite3.Connection) -> dict:
     db.row_factory = sqlite3.Row
     c = db.cursor()
     out: dict = {}
@@ -135,16 +169,25 @@ def probe_db(db_path: Path) -> dict:
     out["edges_total"] = c.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
     out["communities_total"] = c.execute("SELECT COUNT(*) FROM communities").fetchone()[0]
 
-    # Singleton communities are a smell — usually leaked artifacts
+    # Singleton communities are a smell — usually leaked artifacts.
+    # A malformed JSON in node_ids (e.g., schema drift) must NOT crash the
+    # whole probe — skip the row and continue.
     singletons = []
+    malformed = 0
     for r in c.execute(
         "SELECT id, label, node_ids FROM communities ORDER BY id"
     ).fetchall():
-        members = json.loads(r["node_ids"])
+        try:
+            members = json.loads(r["node_ids"])
+        except (json.JSONDecodeError, TypeError):
+            malformed += 1
+            continue
         if len(members) <= 1:
             singletons.append({"id": r["id"], "label": r["label"], "members": members})
     out["communities_singleton"] = len(singletons)
     out["singleton_details"] = singletons
+    if malformed:
+        out["communities_malformed"] = malformed
 
     # Top stubs by inbound link count — these are high-value missing nodes
     out["top_stubs"] = [
@@ -192,22 +235,40 @@ def probe_db(db_path: Path) -> dict:
     # Top 5 bridges (drift signal — bridge identity changes over time signal pipeline shifts)
     # Lazy import — graphology runs inside the kg CLI, not here. Skip in DB probe.
 
-    db.close()
     return out
 
 
 def read_last_log_row() -> dict | None:
+    """Return the LAST successfully-parsed JSON line from the evolution log.
+
+    Per-line try/except so a partial / corrupted final line (e.g., from a
+    crashed prior run) doesn't silently disable drift detection. Without
+    this, JSONDecodeError for the WHOLE file caused the function to return
+    None, which masked all stub_spike / node_count_drift lints for the
+    next cycle (architect/3 finding).
+    """
     if not LOG_PATH.exists():
         return None
     last: dict | None = None
+    bad_lines = 0
     try:
         with LOG_PATH.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     last = json.loads(line)
-    except (OSError, json.JSONDecodeError):
+                except json.JSONDecodeError:
+                    bad_lines += 1
+                    continue
+    except OSError:
         return None
+    if bad_lines:
+        sys.stderr.write(
+            f"warn: skipped {bad_lines} malformed JSONL line(s) in "
+            f"{LOG_PATH.name}\n"
+        )
     return last
 
 
@@ -238,33 +299,38 @@ def compute_lints(probe: dict, prev: dict | None) -> list[dict]:
             "evidence": leaked,
         })
 
-    # Stub growth > 25% since last run = drift signal
+    # Stub growth > 25% since last run = drift signal.
+    # Use float comparison, NOT int(prev * ratio) — for prev=3, int(3 * 1.25) = 3
+    # so any cur >= 3 triggers (including 3 == prev, no growth at all).
     if prev:
         prev_stubs = prev.get("probe", {}).get("nodes_stub", 0)
         cur_stubs = probe.get("nodes_stub", 0)
-        if prev_stubs > 0 and cur_stubs >= int(prev_stubs * 1.25):
+        if prev_stubs > 0 and cur_stubs > prev_stubs * STUB_SPIKE_RATIO:
+            pct = ((STUB_SPIKE_RATIO - 1) * 100)
             lints.append({
                 "severity": "MEDIUM",
                 "code": "stub_spike",
                 "message": (
                     f"Stub count grew {prev_stubs} -> {cur_stubs} "
-                    f"(+{cur_stubs - prev_stubs}, > 25%). "
+                    f"(+{cur_stubs - prev_stubs}, > {pct:.0f}%). "
                     "Wiki-link integrity may be degrading."
                 ),
                 "evidence": {"prev": prev_stubs, "current": cur_stubs},
             })
 
-    # Real-node count change > 10% (suspicious — vault rebuild may have failed)
+    # Real-node count change > 10% (suspicious — vault rebuild may have failed).
+    # Float comparison, same rationale as stub_spike.
     if prev:
         prev_real = prev.get("probe", {}).get("nodes_real", 0)
         cur_real = probe.get("nodes_real", 0)
-        if prev_real > 0 and abs(cur_real - prev_real) > int(prev_real * 0.10):
+        if prev_real > 0 and abs(cur_real - prev_real) > prev_real * NODE_DRIFT_RATIO:
+            pct = NODE_DRIFT_RATIO * 100
             lints.append({
                 "severity": "MEDIUM",
                 "code": "node_count_drift",
                 "message": (
                     f"Real-node count changed {prev_real} -> {cur_real} "
-                    f"({cur_real - prev_real:+d}, > 10%). "
+                    f"({cur_real - prev_real:+d}, > {pct:.0f}%). "
                     "Investigate vault rebuild log or filesystem changes."
                 ),
                 "evidence": {"prev": prev_real, "current": cur_real},
@@ -272,18 +338,29 @@ def compute_lints(probe: dict, prev: dict | None) -> list[dict]:
 
     # Top stubs that have crossed >= 5 inbound = candidates for promotion to real nodes
     promotion_candidates = [
-        s for s in probe.get("top_stubs", []) if s["inbound"] >= 5
+        s for s in probe.get("top_stubs", []) if s["inbound"] >= PROMOTION_INBOUND_MIN
     ]
     if promotion_candidates:
         lints.append({
             "severity": "LOW",
             "code": "stub_promotion_candidates",
             "message": (
-                f"{len(promotion_candidates)} stubs have >= 5 inbound links. "
-                "Consider creating these nodes (kg_create_node) or symlinking "
-                "from project memory."
+                f"{len(promotion_candidates)} stubs have >= {PROMOTION_INBOUND_MIN} "
+                "inbound links. Consider creating these nodes (kg_create_node) or "
+                "symlinking from project memory."
             ),
             "evidence": promotion_candidates,
+        })
+
+    # If probe failed (DB locked / corrupted), flag it explicitly so the cycle
+    # row records it and the user knows the metrics are stale.
+    if probe.get("_db_error") or probe.get("_db_missing"):
+        err = probe.get("_db_error") or "kg.db not found"
+        lints.append({
+            "severity": "HIGH",
+            "code": "probe_failure",
+            "message": f"kg.db probe failed: {err}",
+            "evidence": {"error": err},
         })
 
     return lints

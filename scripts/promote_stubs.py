@@ -98,8 +98,12 @@ def resolve_paths() -> tuple[Path, Path]:
 
 import re as _re
 
-_WIKILINK = _re.compile(r"\[\[([^\]]+)\]\]")
-_WIKILINK_DANGLING = _re.compile(r"\[\[[^\]]*$")
+# Defense in depth: same newline-safe constraint as src/lib/wiki-links.ts.
+# Even though _truncate_clean() runs first to drop trailing `[[X` fragments,
+# we don't rely on that — keep the regex single-line so we can't reintroduce
+# the original parser bug.
+_WIKILINK = _re.compile(r"\[\[([^\]\n]+)\]\]")
+_WIKILINK_DANGLING = _re.compile(r"\[\[[^\]\n]*$")
 
 
 def _scrub_wiki_links(text: str) -> str:
