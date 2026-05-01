@@ -8,7 +8,7 @@ import {
 } from './wiki-links.js';
 import type { ParsedNode, ParsedEdge } from './types.js';
 
-const EXCLUDED_DIRS = new Set(['.obsidian', '_FileOrganizer2000', 'attachments']);
+const EXCLUDED_DIRS = new Set(['.obsidian', '_FileOrganizer2000', 'attachments', 'output', 'scripts']);
 
 export interface ParseResult {
   nodes: ParsedNode[];
