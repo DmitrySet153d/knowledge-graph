@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -66,12 +67,21 @@ def resolve_paths() -> tuple[Path, Path]:
     return vault, data
 
 
+def _resolve_npx() -> str:
+    """Find the npx binary. On Windows, this is `npx.cmd`. shutil.which
+    resolves both .exe and .cmd via the PATHEXT mechanism, so we get the
+    actual path without needing shell=True (which has documented unsafety
+    when combined with a list-style args).
+    """
+    return shutil.which("npx") or "npx"
+
+
 def run_index(force: bool, quiet: bool, vault: Path, data: Path) -> tuple[int, dict, float]:
     """Invoke `npx tsx src/cli/index.ts index`. Returns (exit, stats_dict, seconds)."""
     # Top-level options (--vault-path / --data-dir) come BEFORE the subcommand
     # name per commander.js conventions.
     args = [
-        "npx", "tsx", "src/cli/index.ts",
+        _resolve_npx(), "tsx", "src/cli/index.ts",
         "--vault-path", str(vault).replace("\\", "/"),
         "--data-dir", str(data).replace("\\", "/"),
         "index",
@@ -82,11 +92,9 @@ def run_index(force: bool, quiet: bool, vault: Path, data: Path) -> tuple[int, d
     env["KG_VAULT_PATH"] = str(vault)
     env["KG_DATA_DIR"] = str(data)
     start = time.time()
-    # Defensive: shell=False is the safe Python convention (Python docs warn
-    # that shell=True+list has implementation-defined behavior). On Python 3.14
-    # the args ARE forwarded correctly (verified by `force=True` runs producing
-    # the expected `nodesIndexed=N skipped=0`), but we don't rely on the quirk.
-    # `npx.cmd` is on PATH so shell=False resolves it without invoking cmd.exe.
+    # shell=False is the safe Python convention. On Windows we resolve
+    # `npx.cmd` explicitly via shutil.which so CreateProcess can find it
+    # without invoking cmd.exe. The full path is in args[0] now.
     proc = subprocess.run(
         args,
         cwd=REPO_ROOT,
@@ -167,7 +175,7 @@ def _probe_via_cli(vault: Path | None, data: Path | None) -> dict | None:
     """Try `npx tsx src/cli/index.ts probe`. Returns None on any failure so
     the caller falls through to direct SQL — never raises.
     """
-    args = ["npx", "tsx", "src/cli/index.ts"]
+    args = [_resolve_npx(), "tsx", "src/cli/index.ts"]
     if vault is not None:
         args += ["--vault-path", str(vault).replace("\\", "/")]
     if data is not None:
