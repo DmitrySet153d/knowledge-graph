@@ -13,11 +13,12 @@ export function extractWikiLinks(markdown: string): RawLink[] {
   const withoutCode = markdown.replace(/```[\s\S]*?```/g, '')
     .replace(/`[^`]+`/g, '');
 
-  // Match [[...]] but not ![[...]]. Disallow newlines and pipe-stripping
-  // happens after — keep the inner constraint single-line so a truncated /
-  // malformed `[[X` at end of paragraph doesn't gobble subsequent paragraphs
-  // until the next `]]` arrives much later.
-  const pattern = /(?<!!)\[\[([^\]\n]+)\]\]/g;
+  // Match [[...]] but not ![[...]]. Disallow CR + LF inside the inner so a
+  // truncated `[[X` at end of paragraph cannot gobble subsequent paragraphs
+  // until the next `]]` arrives. \r alongside \n covers both Unix LF and
+  // legacy Mac CR-only line endings (and is harmless on CRLF since the LF
+  // alone is sufficient there).
+  const pattern = /(?<!!)\[\[([^\]\r\n]+)\]\]/g;
   let match;
   while ((match = pattern.exec(withoutCode)) !== null) {
     const inner = match[1];

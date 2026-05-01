@@ -49,6 +49,43 @@ describe('extractWikiLinks', () => {
     expect(links).toHaveLength(1);
     expect(links[0].raw).toBe('BOM');
   });
+
+  it('does not match empty [[]]', () => {
+    // `[[]]` has zero chars between the brackets and must NOT produce a stub.
+    // Without the `+` (one-or-more) the regex would emit a link with raw=''.
+    const links = extractWikiLinks('Empty [[]] then [[Real]] there.');
+    expect(links).toEqual([{ raw: 'Real', display: null }]);
+  });
+
+  it('does not span CR-only line endings (legacy Mac files)', () => {
+    // Files with bare \r (no \n) historically came from classic Mac OS but
+    // also surface from corrupt text files and certain copy-paste flows.
+    // Without \r in the exclusion class, the regex would capture across
+    // logical lines just like the LF case.
+    const md = '- truncated [[Compliance.md\r- next line\r- and [[BOM]] real';
+    const links = extractWikiLinks(md);
+    expect(links).toHaveLength(1);
+    expect(links[0].raw).toBe('BOM');
+  });
+
+  it('does not span newlines inside a pipe-aliased link', () => {
+    // The alias half (after `|`) must also obey the \n exclusion — otherwise
+    // a malformed `[[X|alias text\nnext paragraph]]` would gobble paragraphs.
+    const md = 'Link with [[Real|alias text\nnext line text]] real ending';
+    const links = extractWikiLinks(md);
+    // The single-line constraint blocks the entire match — no link extracted.
+    expect(links).toEqual([]);
+  });
+
+  it('matches whitespace-only [[   ]] (documents current behaviour)', () => {
+    // The regex captures whitespace as a valid inner. This produces a stub
+    // with a whitespace-only ID, which the resolver returns null for and
+    // store deduplicates by exact string. Documented here so a future change
+    // is intentional, not accidental.
+    const links = extractWikiLinks('Stray [[   ]] here.');
+    expect(links).toHaveLength(1);
+    expect(links[0].raw).toBe('   ');
+  });
 });
 
 describe('buildStemLookup', () => {

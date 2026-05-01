@@ -66,6 +66,54 @@ describe('IndexPipeline', () => {
     freshStore.close();
   });
 
+  it('cleans FTS5 + sqlite-vec rows when a node is deleted', async () => {
+    // Regression: deleteNode() must remove the node's rowid from BOTH the
+    // FTS5 contentless mirror (nodes_fts) and the sqlite-vec virtual table
+    // (nodes_vec). Bare DELETE on `nodes` does not cascade to either; FTS5
+    // requires the explicit `INSERT INTO nodes_fts(...)VALUES('delete',...)`
+    // and sqlite-vec needs a separate DELETE on its rowid.
+    const freshStore = new Store(':memory:');
+    const freshPipeline = new IndexPipeline(freshStore, embedder);
+    await freshPipeline.index(FIXTURE_VAULT);
+
+    const targetId = 'People/Alice Smith.md';
+    const before = freshStore.db
+      .prepare('SELECT rowid FROM nodes WHERE id = ?')
+      .get(targetId) as { rowid: number } | undefined;
+    expect(before).toBeDefined();
+    const rowid = before!.rowid;
+
+    // Sanity: Alice should be in both FTS5 and sqlite-vec before deletion.
+    const ftsBefore = freshStore.db
+      .prepare('SELECT rowid FROM nodes_fts WHERE rowid = ?')
+      .get(rowid);
+    expect(ftsBefore).toBeDefined();
+    const vecBefore = freshStore.db
+      .prepare('SELECT rowid FROM nodes_vec WHERE rowid = ?')
+      .get(BigInt(rowid));
+    expect(vecBefore).toBeDefined();
+
+    freshStore.deleteNode(targetId);
+
+    // Both shadow tables MUST be cleaned, otherwise full-text and vector
+    // search would return stale matches pointing at a node that no longer
+    // exists in `nodes`.
+    const nodeAfter = freshStore.db
+      .prepare('SELECT id FROM nodes WHERE id = ?')
+      .get(targetId);
+    expect(nodeAfter).toBeUndefined();
+    const ftsAfter = freshStore.db
+      .prepare('SELECT rowid FROM nodes_fts WHERE rowid = ?')
+      .get(rowid);
+    expect(ftsAfter).toBeUndefined();
+    const vecAfter = freshStore.db
+      .prepare('SELECT rowid FROM nodes_vec WHERE rowid = ?')
+      .get(BigInt(rowid));
+    expect(vecAfter).toBeUndefined();
+
+    freshStore.close();
+  });
+
   it('recomputes communities when nodes are deleted', async () => {
     // Regression: prior to this fix, index() only re-ran community detection on
     // additions/stubs. Pure-deletion runs left orphan singleton communities

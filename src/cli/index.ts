@@ -223,6 +223,97 @@ program
   });
 
 program
+  .command('probe')
+  .description('Emit health-probe JSON of the indexed graph (nodes/edges/stubs/communities/sections)')
+  .action(() => {
+    const store = getStore();
+    const db = store.db;
+    const one = (sql: string, p: unknown[] = []) =>
+      (db.prepare(sql).get(...p) as { c: number } | undefined)?.c ?? 0;
+
+    const nodesTotal = one('SELECT COUNT(*) AS c FROM nodes');
+    const nodesReal = one(
+      "SELECT COUNT(*) AS c FROM nodes WHERE id NOT LIKE '_stub/%'",
+    );
+    const nodesStub = one(
+      "SELECT COUNT(*) AS c FROM nodes WHERE id LIKE '_stub/%'",
+    );
+    const edgesTotal = one('SELECT COUNT(*) AS c FROM edges');
+    const communitiesTotal = one('SELECT COUNT(*) AS c FROM communities');
+
+    const singletonDetails: Array<{ id: number; label: string; members: string[] }> = [];
+    let communitiesMalformed = 0;
+    const commRows = db
+      .prepare('SELECT id, label, node_ids FROM communities ORDER BY id')
+      .all() as Array<{ id: number; label: string; node_ids: string }>;
+    for (const r of commRows) {
+      let members: string[] | null = null;
+      try {
+        const parsed = JSON.parse(r.node_ids);
+        if (Array.isArray(parsed)) members = parsed.map(String);
+      } catch {
+        // fall through
+      }
+      if (members === null) {
+        communitiesMalformed++;
+        continue;
+      }
+      if (members.length <= 1) {
+        singletonDetails.push({ id: r.id, label: r.label, members });
+      }
+    }
+
+    const topStubsRows = db
+      .prepare(
+        `SELECT n.id AS id, COUNT(*) AS inbound FROM nodes n
+         JOIN edges e ON e.target_id = n.id
+         WHERE n.id LIKE '_stub/%'
+         GROUP BY n.id ORDER BY inbound DESC LIMIT 10`,
+      )
+      .all() as Array<{ id: string; inbound: number }>;
+
+    const leakedPrefixes = ['output/', 'scripts/', 'vault_backup_', '_FileOrganizer2000/'];
+    const leaked: Record<string, number> = {};
+    for (const prefix of leakedPrefixes) {
+      const n = one('SELECT COUNT(*) AS c FROM nodes WHERE id LIKE ?', [prefix + '%']);
+      if (n) leaked[prefix.replace(/\/$/, '')] = n;
+    }
+
+    const sectionRows = db
+      .prepare(
+        `SELECT CASE WHEN id LIKE '%/%' THEN substr(id, 1, instr(id, '/')-1) ELSE id END AS section,
+                COUNT(*) AS n
+         FROM nodes WHERE id NOT LIKE '_stub/%'
+         GROUP BY section`,
+      )
+      .all() as Array<{ section: string; n: number }>;
+    const sections: Record<string, number> = {};
+    for (const r of sectionRows) sections[r.section] = r.n;
+
+    const lastIndexed = db
+      .prepare('SELECT MAX(indexed_at) AS m FROM sync')
+      .get() as { m: number | null } | undefined;
+
+    const probe: Record<string, unknown> = {
+      nodes_total: nodesTotal,
+      nodes_real: nodesReal,
+      nodes_stub: nodesStub,
+      edges_total: edgesTotal,
+      communities_total: communitiesTotal,
+      communities_singleton: singletonDetails.length,
+      singleton_details: singletonDetails,
+      top_stubs: topStubsRows.map((r) => ({ id: r.id, inbound: r.inbound })),
+      leaked_artifact_nodes: leaked,
+      sections,
+      last_indexed_at_ms: lastIndexed?.m ?? null,
+    };
+    if (communitiesMalformed > 0) probe.communities_malformed = communitiesMalformed;
+
+    output(probe);
+    store.close();
+  });
+
+program
   .command('central')
   .description('Find central nodes (PageRank)')
   .option('--community <id>', 'Restrict to a community')

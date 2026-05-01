@@ -130,8 +130,9 @@ def run_index(force: bool, quiet: bool, vault: Path, data: Path) -> tuple[int, d
     return 0, stats, elapsed
 
 
-def probe_db(db_path: Path) -> dict:
-    """Read additional health metrics directly from kg.db.
+def probe_db(db_path: Path, vault: Path | None = None, data: Path | None = None) -> dict:
+    """Read health metrics. Prefer the `kg probe` CLI (decoupled from kg.db
+    schema), fall back to direct SQL if the CLI is unavailable or fails.
 
     Returns a dict that always includes _db_missing or _db_error on failure
     rather than raising — caller can still log the run and lint on the
@@ -139,6 +140,13 @@ def probe_db(db_path: Path) -> dict:
     """
     if not db_path.exists():
         return {"_db_missing": True}
+
+    # Path 1: ask the CLI (decoupled from schema; survives kg.db schema changes).
+    cli_result = _probe_via_cli(vault, data)
+    if cli_result is not None:
+        return cli_result
+
+    # Path 2: direct SQL fallback (in case the CLI is offline or rejected).
     try:
         db = sqlite3.connect(str(db_path), timeout=DB_PROBE_TIMEOUT)
     except sqlite3.OperationalError as e:
@@ -153,6 +161,61 @@ def probe_db(db_path: Path) -> dict:
             db.close()
         except Exception:
             pass
+
+
+def _probe_via_cli(vault: Path | None, data: Path | None) -> dict | None:
+    """Try `npx tsx src/cli/index.ts probe`. Returns None on any failure so
+    the caller falls through to direct SQL — never raises.
+    """
+    args = ["npx", "tsx", "src/cli/index.ts"]
+    if vault is not None:
+        args += ["--vault-path", str(vault).replace("\\", "/")]
+    if data is not None:
+        args += ["--data-dir", str(data).replace("\\", "/")]
+    args.append("probe")
+    try:
+        env = os.environ.copy()
+        if vault is not None:
+            env["KG_VAULT_PATH"] = str(vault)
+        if data is not None:
+            env["KG_DATA_DIR"] = str(data)
+        proc = subprocess.run(
+            args,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            env=env,
+            timeout=DB_PROBE_TIMEOUT * 4,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        # The CLI emits exactly one JSON object on stdout; if there's preamble
+        # noise (rare), find the first balanced { ... }.
+        if raw.startswith("{"):
+            return json.loads(raw)
+        depth = 0
+        start_idx = -1
+        for i, ch in enumerate(raw):
+            if ch == "{":
+                if depth == 0:
+                    start_idx = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start_idx >= 0:
+                    return json.loads(raw[start_idx : i + 1])
+    except json.JSONDecodeError:
+        return None
+    return None
 
 
 def _probe_db_inner(db: sqlite3.Connection) -> dict:
@@ -409,7 +472,7 @@ def main() -> int:
         if rc != 0:
             return 2
 
-    probe = probe_db(db_path)
+    probe = probe_db(db_path, vault=vault, data=data)
     prev = read_last_log_row()
     lints = compute_lints(probe, prev)
 

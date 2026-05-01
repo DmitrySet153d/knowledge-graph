@@ -17,7 +17,9 @@ Usage:
     python scripts/promote_stubs.py --apply   [--threshold 5]
 
 After --apply, run `python scripts/evolution_cycle.py --quiet` to re-index
-and verify the stubs disappeared from the lint.
+and verify the stubs disappeared from the lint. The script auto-bumps
+mtimes of source files that wiki-link to the promoted stubs so a plain
+incremental run re-resolves those links — no `--force` required.
 
 Safety:
   * Default is --dry-run; --apply is required to write files.
@@ -32,6 +34,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -101,9 +104,10 @@ import re as _re
 # Defense in depth: same newline-safe constraint as src/lib/wiki-links.ts.
 # Even though _truncate_clean() runs first to drop trailing `[[X` fragments,
 # we don't rely on that — keep the regex single-line so we can't reintroduce
-# the original parser bug.
-_WIKILINK = _re.compile(r"\[\[([^\]\n]+)\]\]")
-_WIKILINK_DANGLING = _re.compile(r"\[\[[^\]\n]*$")
+# the original parser bug. \r is excluded alongside \n so legacy Mac CR-only
+# line endings cannot widen the match across logical lines.
+_WIKILINK = _re.compile(r"\[\[([^\]\r\n]+)\]\]")
+_WIKILINK_DANGLING = _re.compile(r"\[\[[^\]\r\n]*$")
 
 
 def _scrub_wiki_links(text: str) -> str:
@@ -312,6 +316,50 @@ def plan_writes(vault: Path, stubs: list[dict]) -> list[dict]:
     return plan
 
 
+def force_reindex_link_sources(
+    vault: Path, db_path: Path, promoted_stub_ids: list[str]
+) -> int:
+    """Bump mtimes of vault files that wiki-link to a promoted stub.
+
+    Closes the closed-loop convergence gap (architect/1 finding):
+
+    Without this, after promote_stubs writes Topics/X.md, the next
+    incremental `kg index` parses the new file but does NOT re-parse
+    source files that contain `[[X]]` (their mtimes are unchanged).
+    Result: X stays orphan with 0 inbound until the user manually runs
+    --force.
+
+    Fix: query edges where target_id matches the promoted stubs, get
+    distinct source_ids, and `os.utime()` each one. Next incremental run
+    sees them as changed and re-resolves the wiki-links to the now-real
+    targets.
+
+    Returns the number of files touched.
+    """
+    if not db_path.exists() or not promoted_stub_ids:
+        return 0
+    db = sqlite3.connect(str(db_path))
+    c = db.cursor()
+    placeholders = ",".join("?" * len(promoted_stub_ids))
+    rows = c.execute(
+        f"SELECT DISTINCT source_id FROM edges WHERE target_id IN ({placeholders})",
+        promoted_stub_ids,
+    ).fetchall()
+    db.close()
+    now = time.time()
+    touched = 0
+    for (source_id,) in rows:
+        # source_id is vault-relative
+        full = vault / source_id
+        if full.exists():
+            try:
+                os.utime(full, (now, now))
+                touched += 1
+            except OSError:
+                pass
+    return touched
+
+
 def apply_plan(plan: list[dict], overwrite: bool) -> dict:
     created, updated, skipped = 0, 0, 0
     skipped_targets: list[str] = []
@@ -385,10 +433,26 @@ def main() -> int:
     if result["skipped_targets"] and not overwrite:
         for t in result["skipped_targets"]:
             print(f"  skipped: {t}")
+
+    # Closed-loop convergence (architect/1 finding from adversarial review):
+    # Bump mtimes of every vault file that wiki-links to a promoted stub so
+    # the next incremental `kg index` re-resolves those links to the now-real
+    # targets. Without this, a plain incremental run would leave the new
+    # pages orphan with 0 inbound until a manual --force.
+    promoted_ids = [
+        p["stub_id"] for p in plan
+        if (not p["exists"] or overwrite)
+    ]
+    if result["created"] > 0 or result["updated"] > 0:
+        touched = force_reindex_link_sources(vault, db_path, promoted_ids)
+        print()
+        print(
+            f"Touched {touched} source file(s) so the next incremental run "
+            "re-resolves their wiki-links."
+        )
     print()
-    print("Next: re-run kg evolution cycle WITH --force to re-resolve wiki-links")
-    print("from existing source files (incremental skip would miss them):")
-    print("  python scripts/evolution_cycle.py --force --quiet")
+    print("Next: run a regular evolution cycle (no --force needed):")
+    print("  python scripts/evolution_cycle.py --quiet")
     return 0
 
 
