@@ -56,10 +56,36 @@ describe('IndexPipeline', () => {
 
     const first = await freshPipeline.index(FIXTURE_VAULT);
     expect(first.nodesIndexed).toBeGreaterThan(0);
+    expect(first.nodesDeleted).toBe(0);
 
     const second = await freshPipeline.index(FIXTURE_VAULT);
     expect(second.nodesIndexed).toBe(0);
     expect(second.nodesSkipped).toBe(first.nodesIndexed);
+    expect(second.nodesDeleted).toBe(0);
+
+    freshStore.close();
+  });
+
+  it('recomputes communities when nodes are deleted', async () => {
+    // Regression: prior to this fix, index() only re-ran community detection on
+    // additions/stubs. Pure-deletion runs left orphan singleton communities
+    // pointing at gone nodes.
+    const freshStore = new Store(':memory:');
+    const freshPipeline = new IndexPipeline(freshStore, embedder);
+
+    await freshPipeline.index(FIXTURE_VAULT);
+    const initialCommunities = freshStore.getAllCommunities().length;
+    expect(initialCommunities).toBeGreaterThan(0);
+
+    // Inject a phantom path into sync — simulates a file that existed last run
+    // but is gone this run. parseVault won't see it; deletion path will fire.
+    freshStore.upsertSync('People/_Phantom.md', Date.now());
+    expect(freshStore.getAllSyncPaths()).toContain('People/_Phantom.md');
+
+    const stats = await freshPipeline.index(FIXTURE_VAULT);
+    expect(stats.nodesDeleted).toBe(1);
+    expect(stats.communitiesDetected).toBeGreaterThan(0);
+    expect(freshStore.getAllSyncPaths()).not.toContain('People/_Phantom.md');
 
     freshStore.close();
   });

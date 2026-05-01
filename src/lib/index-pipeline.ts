@@ -8,6 +8,7 @@ import { KnowledgeGraph } from './graph.js';
 export interface IndexStats {
   nodesIndexed: number;
   nodesSkipped: number;
+  nodesDeleted: number;
   edgesIndexed: number;
   communitiesDetected: number;
   stubNodesCreated: number;
@@ -23,6 +24,7 @@ export class IndexPipeline {
     const stats: IndexStats = {
       nodesIndexed: 0,
       nodesSkipped: 0,
+      nodesDeleted: 0,
       edgesIndexed: 0,
       communitiesDetected: 0,
       stubNodesCreated: 0,
@@ -36,6 +38,7 @@ export class IndexPipeline {
     for (const oldPath of previousPaths) {
       if (!currentPaths.has(oldPath)) {
         this.store.deleteNode(oldPath);
+        stats.nodesDeleted++;
       }
     }
 
@@ -82,8 +85,9 @@ export class IndexPipeline {
       }
     }
 
-    // If any nodes were indexed, re-run community detection
-    if (stats.nodesIndexed > 0 || stats.stubNodesCreated > 0) {
+    // Re-run community detection on any structural change (add / delete / stub).
+    // Without this, deletions leave singleton communities pointing at gone nodes.
+    if (stats.nodesIndexed > 0 || stats.stubNodesCreated > 0 || stats.nodesDeleted > 0) {
       const kg = KnowledgeGraph.fromStore(this.store);
       const communities = kg.detectCommunities(resolution);
       this.store.clearCommunities();

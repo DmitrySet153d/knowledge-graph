@@ -5,3 +5,6 @@ dist/
 /vault/
 data/
 docs/superpowers/
+output/
+__pycache__/
+*.pyc
