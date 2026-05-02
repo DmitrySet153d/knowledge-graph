@@ -17,8 +17,13 @@ if errorlevel 1 (
 )
 set LOGFILE=G:\Other computers\My Computer\Development\knowledge-graph\output\evolution_cycle.log
 
-REM Log rotation (>1 MB)
-powershell -Command "if ((Test-Path '%LOGFILE%') -and (Get-Item '%LOGFILE%').Length -gt 1MB) { Move-Item '%LOGFILE%' '%LOGFILE%.old' -Force }" >nul 2>&1
+REM Log rotation (>1 MB) — pure cmd, no PowerShell subprocess (Defender PowhidSubExec heuristic)
+if exist "%LOGFILE%" (
+    for %%I in ("%LOGFILE%") do if %%~zI gtr 1048576 (
+        if exist "%LOGFILE%.old" del /q "%LOGFILE%.old"
+        move /y "%LOGFILE%" "%LOGFILE%.old" >nul 2>&1
+    )
+)
 
 if not exist output mkdir output
 
