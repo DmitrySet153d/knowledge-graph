@@ -20,7 +20,6 @@ set LOGFILE=G:\Other computers\My Computer\Development\knowledge-graph\output\ev
 REM Log rotation (>1 MB) — pure cmd, no PowerShell subprocess (Defender PowhidSubExec heuristic)
 if exist "%LOGFILE%" (
     for %%I in ("%LOGFILE%") do if %%~zI gtr 1048576 (
-        if exist "%LOGFILE%.old" del /q "%LOGFILE%.old"
         move /y "%LOGFILE%" "%LOGFILE%.old" >nul 2>&1
     )
 )
