@@ -8,3 +8,6 @@ docs/superpowers/
 output/
 __pycache__/
 *.pyc
+
+# IDE
+.claude/
